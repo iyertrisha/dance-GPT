@@ -1,131 +1,270 @@
-# DanceGPT — System Design
+# Final System Design: Bharatanatyam Gandharva Study Helper
 
-## Overview
+---
 
-DanceGPT is an AI-powered study tool for dance students. Users upload PDF sheet music / notation, and the system performs OCR, embeds content into a vector store, and provides RAG-based Q&A, flashcard generation, and note-taking.
+## Confirmed tech stack
+
+| Layer | Technology | Reason |
+|-------|-----------|--------|
+| **Frontend** | Next.js (React) | Full web app, SSR, easy API routing |
+| **Node.js API** | Express or Fastify | Auth, sessions, notes, flashcards, proxy to Python |
+| **Python AI service** | FastAPI | RAG, embeddings, flashcard generation |
+| **LLM** | DeepSeek API (`deepseek-chat`) | Cheap, multilingual, OpenAI-compatible SDK |
+| **Embeddings** | BAAI BGE-M3 (local, `sentence-transformers`) | Free, no API key, supports Devanagari + English |
+| **Vector store** | LanceDB (local files) | Embedded, no separate server, Python-native |
+| **Database** | Postgres | Auth, sessions, notes, flashcards, chat history |
+| **OCR** | Google Cloud Vision API | Handles handwriting + mixed Devanagari/English |
+| **PDF ingestion** | Local CLI Python script (you run it) | No admin web UI needed |
 
 ---
 
 ## Architecture
 
 ```
-flowchart LR
-  subgraph local [Local Machine]
-    frontend["Next.js :3000"]
-    api["Node API :3001"]
-    ai["Python AI :8000"]
-    pg["Postgres :5432"]
-  end
-  frontend -->|REST + cookie| api
-  api -->|SQL| pg
-  api -->|Internal HTTP| ai
-  ai -->|SQL| pg
+┌──────────────────────────────────────────────────┐
+│              BROWSER (Next.js)                   │
+│   /login  /chat  /notes  /flashcards             │
+└────────────────────┬─────────────────────────────┘
+                     │ HTTPS / REST + cookies
+                     ▼
+┌──────────────────────────────────────────────────┐
+│           NODE.JS API  (Express/Fastify)         │
+│                                                  │
+│  auth │ sessions │ notes │ flashcards (serve +   │
+│  save) │ chat history │ proxy to Python          │
+└───────────────┬──────────────────────────────────┘
+                │                │
+        SQL     │                │ Internal HTTP
+                ▼                ▼
+        ┌───────────┐    ┌───────────────────────┐
+        │ POSTGRES  │    │  PYTHON AI SERVICE    │
+        │           │    │  (FastAPI)            │
+        │ users     │    │                       │
+        │ sessions  │◄───│  RAG query            │
+        │ notes     │    │  Flashcard generation │
+        │ flashcards│    │  Embedding + indexing │
+        │ chat_msgs │    └──────────┬────────────┘
+        └───────────┘               │
+                              ┌─────▼──────┐
+                              │  LANCEDB   │
+                              │ (./data/   │
+                              │  lancedb/) │
+                              └────────────┘
+
+══════════ OFFLINE (you run this once before go-live) ══════════
+
+Your PDFs → ocr_ingest.py → Google Cloud Vision API
+         → text + page metadata per PDF
+         → chunk_and_index.py → BGE-M3 (local) → LanceDB
+         → document record → Postgres
 ```
 
 ---
 
-## Services
+## Postgres schema
 
-| Service | Stack | Port |
-|---------|-------|------|
-| Frontend | Next.js 14 (App Router, TypeScript, Tailwind) | 3000 |
-| API | Node.js / Express | 3001 |
-| AI | Python / FastAPI | 8000 |
-| Database | Postgres 16 | 5432 |
-| Vector Store | LanceDB (file-based) | — |
+```sql
+-- Auth
+CREATE TABLE users (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email         TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  level         TEXT NOT NULL,   -- e.g. 'Preliminary', 'Junior', 'Senior'
+  created_at    TIMESTAMPTZ DEFAULT now()
+);
 
----
+CREATE TABLE sessions (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
 
-## Database Schema
+-- Documents (managed by you via CLI)
+CREATE TABLE documents (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  file_name      TEXT NOT NULL,
+  file_path      TEXT NOT NULL,        -- path to PDF on disk
+  ocr_text_path  TEXT,                 -- path to OCR output JSON
+  level          TEXT,                 -- which exam level this belongs to
+  topic          TEXT,                 -- e.g. 'Theory', 'Tala', 'Raga', 'Abhinaya'
+  status         TEXT DEFAULT 'pending',  -- pending | ocr_done | indexed | failed
+  uploaded_at    TIMESTAMPTZ DEFAULT now()
+);
 
-### `users`
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | gen_random_uuid() |
-| email | TEXT UNIQUE | |
-| password_hash | TEXT | bcrypt |
-| display_name | TEXT | |
-| created_at / updated_at | TIMESTAMPTZ | |
+-- Personal notes (per user, typed in app)
+CREATE TABLE notes (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
+  title      TEXT,
+  content    TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
 
-### `sessions`
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | |
-| user_id | UUID FK → users | |
-| token | TEXT UNIQUE | |
-| expires_at | TIMESTAMPTZ | |
+-- Flashcards (global pool, generated from documents)
+CREATE TABLE flashcards (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  doc_id       UUID REFERENCES documents(id),
+  level        TEXT NOT NULL,
+  topic        TEXT,
+  front        TEXT NOT NULL,
+  back         TEXT NOT NULL,
+  generated_at TIMESTAMPTZ DEFAULT now()
+);
 
-### `documents`
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | |
-| user_id | UUID FK → users | |
-| title | TEXT | |
-| file_path | TEXT | path under data/uploads/ |
-| ocr_path | TEXT | path under data/ocr/ |
-| status | TEXT | pending \| processing \| ready \| error |
+-- User-saved flashcards (personal saved collection)
+CREATE TABLE user_saved_flashcards (
+  user_id      UUID REFERENCES users(id) ON DELETE CASCADE,
+  flashcard_id UUID REFERENCES flashcards(id) ON DELETE CASCADE,
+  saved_at     TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (user_id, flashcard_id)
+);
 
-### `notes`
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | |
-| user_id | UUID FK → users | |
-| document_id | UUID FK → documents | nullable |
-| title | TEXT | |
-| content | TEXT | |
+-- Chat
+CREATE TABLE chat_sessions (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
+  title      TEXT,                     -- optional, auto-named or user-named
+  created_at TIMESTAMPTZ DEFAULT now()
+);
 
-### `flashcards`
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | |
-| document_id | UUID FK → documents | |
-| front | TEXT | |
-| back | TEXT | |
-
-### `user_saved_flashcards`
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | |
-| user_id | UUID FK → users | |
-| flashcard_id | UUID FK → flashcards | |
-| UNIQUE (user_id, flashcard_id) | | |
-
-### `chat_sessions`
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | |
-| user_id | UUID FK → users | |
-| document_id | UUID FK → documents | nullable |
-| title | TEXT | |
-
-### `chat_messages`
-| Column | Type | Notes |
-|--------|------|-------|
-| id | UUID PK | |
-| chat_session_id | UUID FK → chat_sessions | |
-| role | TEXT | user \| assistant \| system |
-| content | TEXT | |
+CREATE TABLE chat_messages (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  chat_session_id UUID REFERENCES chat_sessions(id) ON DELETE CASCADE,
+  role            TEXT NOT NULL,       -- 'user' | 'assistant'
+  content         TEXT NOT NULL,
+  created_at      TIMESTAMPTZ DEFAULT now()
+);
+```
 
 ---
 
-## Data Flow
+## Data flows
 
-### Upload & Ingestion
-1. User uploads PDF via frontend → `POST /api/documents`
-2. API saves file to `data/uploads/`, creates DB record with `status=pending`
-3. API calls AI service `POST /ingest` with document_id
-4. AI service runs Google Cloud Vision OCR → saves JSON to `data/ocr/`
-5. AI chunks text, embeds with BGE-M3, upserts into LanceDB
-6. AI updates document `status=ready`
+### Offline ingestion (CLI — you run before go-live)
 
-### RAG Q&A
-1. User sends message in chat → `POST /api/chat`
-2. API forwards to AI service `POST /query`
-3. AI embeds query, retrieves top-k chunks from LanceDB
-4. AI builds prompt with retrieved context, calls DeepSeek API
-5. Response streamed back through API to frontend
+- **Step 1: ocr_ingest.py** — For each PDF in `./data/uploads/`, send each page to Google Cloud Vision API; save `./data/ocr/{doc_id}.json`; insert `documents` row with `status = 'ocr_done'`.
+- **Step 2: chunk_and_index.py** — For each document with `status = 'ocr_done'`, read OCR text, chunk (~500 chars, 50 overlap), attach metadata (doc_id, page, level, topic), embed with BGE-M3, upsert into LanceDB, set `documents.status = 'indexed'`.
 
-### Flashcard Generation
-1. `POST /api/flashcards/generate` with document_id
-2. AI summarises document chunks → generates Q/A pairs
-3. Cards stored in `flashcards` table, returned to user
+### User signup / login
+
+- `POST /auth/signup` { email, password, level } → bcrypt hash, insert into users, return 201.
+- `POST /auth/login` { email, password } → verify, create session (7-day expiry), set HTTP-only cookie `session_id`, return user info.
+- All subsequent requests: middleware reads cookie, looks up sessions, attaches user to request.
+
+### RAG chat
+
+- `POST /chat/message` { session_id, content } → Node: auth, save user message, call Python `/ai/chat` { question, level, history } → Python: embed question, query LanceDB, build prompt, call DeepSeek, return answer → Node: save assistant message, return to frontend.
+
+### Flashcard generation and viewing
+
+- `GET /flashcards?topic=...` → cards for user's level + topic, plus saved IDs.
+- `POST /flashcards/generate` { topic } → Python generates from LanceDB chunks via DeepSeek; Node saves to `flashcards`, returns cards.
+- `POST /flashcards/:id/save`, `DELETE /flashcards/:id/save`, `GET /flashcards/saved` for user's saved collection.
+
+### Notes
+
+- `GET /notes`, `POST /notes`, `GET /notes/:id`, `PUT /notes/:id`, `DELETE /notes/:id` — all scoped by user_id.
+
+---
+
+## Full API surface
+
+### Node.js API
+
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| POST | `/auth/signup` | Public | Register |
+| POST | `/auth/login` | Public | Login |
+| POST | `/auth/logout` | Session | Clear session |
+| GET | `/auth/me` | Session | Get current user |
+| GET | `/notes` | Session | List user's notes |
+| POST | `/notes` | Session | Create note |
+| GET | `/notes/:id` | Session | Get note |
+| PUT | `/notes/:id` | Session | Update note |
+| DELETE | `/notes/:id` | Session | Delete note |
+| GET | `/chat/sessions` | Session | List chat sessions |
+| POST | `/chat/sessions` | Session | Start new chat session |
+| GET | `/chat/sessions/:id/messages` | Session | Get messages |
+| POST | `/chat/message` | Session | Send message (proxies to Python) |
+| GET | `/flashcards` | Session | Get cards for user's level + topic |
+| POST | `/flashcards/generate` | Session | Trigger generation (proxies to Python) |
+| GET | `/flashcards/saved` | Session | Get user's saved cards |
+| POST | `/flashcards/:id/save` | Session | Save a card |
+| DELETE | `/flashcards/:id/save` | Session | Unsave a card |
+
+### Python AI service (internal only)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/ai/chat` | RAG query → DeepSeek answer |
+| POST | `/ai/flashcards/generate` | Generate flashcards from LanceDB + DeepSeek |
+
+### CLI scripts (you run locally)
+
+| Script | Purpose |
+|--------|---------|
+| `ocr_ingest.py` | PDFs → Google Cloud Vision → OCR text JSON |
+| `chunk_and_index.py` | OCR text → BGE-M3 → LanceDB + Postgres |
+
+---
+
+## Folder structure
+
+```
+danceGpt/
+├── frontend/                  ← Next.js
+│   └── app/                   (or src/app/)
+│       ├── (auth)/login/
+│       ├── (auth)/signup/
+│       ├── (app)/chat/
+│       ├── notes/
+│       └── flashcards/
+│   └── lib/                   ← API client
+├── api/                       ← Node.js (Express)
+│   ├── routes/
+│   │   ├── auth.js
+│   │   ├── notes.js
+│   │   ├── chat.js
+│   │   └── flashcards.js
+│   ├── middleware/session.js
+│   └── db/
+│       ├── client.js
+│       └── migrations/
+├── ai/                        ← Python (FastAPI)
+│   ├── main.py
+│   ├── rag.py
+│   ├── flashcards.py
+│   ├── embeddings.py
+│   ├── lancedb_client.py
+│   └── routers/chat.py
+├── scripts/
+│   ├── ocr_ingest.py
+│   └── chunk_and_index.py
+├── data/
+│   ├── uploads/
+│   ├── ocr/
+│   └── lancedb/
+├── .env
+├── docker-compose.yml
+└── docs/SYSTEM_DESIGN.md
+```
+
+---
+
+## Implementation order
+
+| Phase | What | Output |
+|-------|------|--------|
+| 1 | Repo + env + Docker Compose for Postgres | App boots, connects to DB |
+| 2 | DB migrations (all tables above) | Schema exists |
+| 3 | Node.js auth (signup, login, session middleware) | Users can log in |
+| 4 | OCR + indexing CLI scripts | PDFs are OCR'd and in LanceDB |
+| 5 | Python AI service: embeddings + RAG query | Chat backend works |
+| 6 | Node.js chat routes + proxy to Python | Chat endpoint returns answers |
+| 7 | Chat UI (Next.js) | Users can chat |
+| 8 | Notes routes (Node.js) + Notes UI | Users can take notes |
+| 9 | Flashcard generation + serve + save routes | Flashcards work end-to-end |
+| 10 | Flashcard UI (flip deck, save button) | Full flashcard feature done |
+| 11 | Polish | Production-ready locally |
