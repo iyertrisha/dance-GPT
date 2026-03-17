@@ -1,262 +1,147 @@
 #!/usr/bin/env python3
 """
-Chunking and indexing script for DanceGPT.
-Reads OCR text, chunks it, embeds with BGE-M3, and writes to LanceDB.
+Chunking and indexing script.
+Reads OCR JSON for pending documents, chunks text, embeds with BGE-M3,
+and writes to LanceDB.
 
 Usage:
     python scripts/chunk_and_index.py
 """
 
-import sys
-import os
 import json
+import os
+import sys
 import uuid
 from pathlib import Path
-from typing import List, Dict, Any
-import psycopg2
+
 from dotenv import load_dotenv
 
-# Add parent directory to path to import ai modules
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+load_dotenv()
 
-from ai.embeddings import EmbeddingService
-from ai.lancedb_client import LanceDBClient
+# Allow imports from ai/ package
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ai"))
 
-# Load environment variables
-load_dotenv(project_root / ".env")
-load_dotenv(project_root / "ai" / ".env")
+from embeddings import EmbeddingService
+from lancedb_client import LanceDBClient
 
-
-def get_db_connection():
-    """Get PostgreSQL connection from environment variables."""
-    return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "localhost"),
-        port=int(os.getenv("POSTGRES_PORT", "5432")),
-        database=os.getenv("POSTGRES_DB", "dancegpt"),
-        user=os.getenv("POSTGRES_USER", "postgres"),
-        password=os.getenv("POSTGRES_PASSWORD", "postgres")
-    )
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+LANCEDB_PATH = os.getenv("LANCEDB_PATH", str(PROJECT_ROOT / "data" / "lancedb"))
 
 
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
-    """
-    Split text into overlapping chunks.
-    
-    Args:
-        text: Input text to chunk
-        chunk_size: Target size of each chunk in characters
-        overlap: Number of overlapping characters between chunks
-        
-    Returns:
-        List of text chunks
-    """
-    if not text or len(text.strip()) == 0:
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
+    """Split text into overlapping character-based chunks."""
+    if not text.strip():
         return []
-    
     chunks = []
     start = 0
-    text_len = len(text)
-    
-    while start < text_len:
+    while start < len(text):
         end = start + chunk_size
-        
-        # If this is not the last chunk and we're not at the end,
-        # try to break at a sentence or word boundary
-        if end < text_len:
-            # Look for sentence boundary (., !, ?)
-            for i in range(min(end, text_len) - 1, max(start, end - 100), -1):
-                if text[i] in '.!?\n':
-                    end = i + 1
-                    break
-            else:
-                # No sentence boundary found, look for word boundary
-                for i in range(min(end, text_len) - 1, max(start, end - 50), -1):
-                    if text[i].isspace():
-                        end = i + 1
-                        break
-        
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        
-        # Move start position with overlap
-        start = end - overlap
-        
-        # Avoid infinite loop if chunk is too small
-        if start <= end - chunk_size + overlap:
-            start = end
-    
-    return chunks
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
+    return [c for c in chunks if c.strip()]
 
 
-def process_document(doc: Dict[str, Any], embedding_service: EmbeddingService, 
-                     lancedb_client: LanceDBClient, conn) -> int:
-    """
-    Process a single document: chunk, embed, and index.
-    
-    Args:
-        doc: Document record from Postgres
-        embedding_service: Embedding service instance
-        lancedb_client: LanceDB client instance
-        conn: PostgreSQL connection
-        
-    Returns:
-        Number of chunks created
-    """
-    doc_id = doc['id']
-    ocr_text_path = doc['ocr_text_path']
-    level = doc['level']
-    topic = doc['topic']
-    
-    print(f"\nProcessing document: {doc['file_name']}")
-    print(f"  Level: {level}, Topic: {topic}")
-    
-    # Read OCR JSON
-    try:
-        with open(ocr_text_path, 'r', encoding='utf-8') as f:
-            ocr_data = json.load(f)
-    except Exception as e:
-        print(f"  Error reading OCR file: {e}")
-        return 0
-    
-    # Extract full text from all pages
-    full_text = ""
-    for page in ocr_data.get('pages', []):
-        full_text += page.get('text', '') + "\n"
-    
-    if not full_text.strip():
-        print(f"  Warning: No text found in OCR output")
-        return 0
-    
-    print(f"  Extracted {len(full_text)} characters of text")
-    
-    # Chunk the text
-    chunks_text = chunk_text(full_text)
-    print(f"  Created {len(chunks_text)} chunks")
-    
-    if not chunks_text:
-        print(f"  Warning: No chunks created")
-        return 0
-    
-    # Embed all chunks
-    print(f"  Embedding {len(chunks_text)} chunks...")
-    try:
-        embeddings = embedding_service.embed_batch(chunks_text)
-        print(f"  ✓ Embedded {len(embeddings)} chunks")
-    except Exception as e:
-        print(f"  Error embedding chunks: {e}")
-        return 0
-    
-    # Create chunk records for LanceDB
-    chunk_records = []
-    for i, (chunk_text, embedding) in enumerate(zip(chunks_text, embeddings)):
-        chunk_records.append({
-            'id': f"{doc_id}_{i}",
-            'doc_id': doc_id,
-            'page_num': 1,  # Simplified for v1; multi-page support can be added later
-            'text': chunk_text,
-            'vector': embedding,
-            'level': level,
-            'topic': topic
-        })
-    
-    # Insert into LanceDB
-    try:
-        lancedb_client.upsert_chunks(chunk_records)
-        print(f"  ✓ Inserted {len(chunk_records)} chunks into LanceDB")
-    except Exception as e:
-        print(f"  Error inserting into LanceDB: {e}")
-        return 0
-    
-    # Update document status in Postgres
+def get_pending_documents():
+    """Fetch documents with status='ocr_done' from Postgres."""
+    import psycopg2
+
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, file_name, ocr_text_path, level, topic FROM documents WHERE status = 'ocr_done'"
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
+def update_document_status(doc_id: str, status: str):
+    """Update the document status in Postgres."""
+    import psycopg2
+
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
     cur = conn.cursor()
     try:
-        cur.execute("""
-            UPDATE documents 
-            SET status = 'indexed'
-            WHERE id = %s
-        """, (doc_id,))
+        cur.execute(
+            "UPDATE documents SET status = %s WHERE id = %s",
+            (status, doc_id),
+        )
         conn.commit()
-        print(f"  ✓ Updated document status to 'indexed'")
-    except Exception as e:
-        conn.rollback()
-        print(f"  Error updating document status: {e}")
-        return 0
     finally:
         cur.close()
-    
-    return len(chunk_records)
+        conn.close()
 
 
 def main():
-    print("=" * 60)
-    print("DanceGPT Chunking and Indexing Pipeline")
-    print("=" * 60)
-    
-    # Initialize services
-    print("\n1. Initializing services...")
-    try:
-        embedding_service = EmbeddingService()
-        lancedb_client = LanceDBClient()
-        conn = get_db_connection()
-        print("✓ All services initialized")
-    except Exception as e:
-        print(f"Error initializing services: {e}")
-        sys.exit(1)
-    
-    # Query for documents with status='ocr_done'
-    print("\n2. Querying for documents with status='ocr_done'...")
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT id, file_name, file_path, ocr_text_path, level, topic
-            FROM documents
-            WHERE status = 'ocr_done'
-            ORDER BY uploaded_at
-        """)
-        rows = cur.fetchall()
-        
-        documents = []
-        for row in rows:
-            documents.append({
-                'id': str(row[0]),
-                'file_name': row[1],
-                'file_path': row[2],
-                'ocr_text_path': row[3],
-                'level': row[4],
-                'topic': row[5]
-            })
-        
-        print(f"Found {len(documents)} document(s) ready for indexing")
-    except Exception as e:
-        print(f"Error querying database: {e}")
-        sys.exit(1)
-    finally:
-        cur.close()
-    
-    if not documents:
-        print("\nNo documents to process. Run ocr_ingest.py first.")
-        conn.close()
+    docs = get_pending_documents()
+
+    if not docs:
+        print("No documents with status='ocr_done' to index.")
         return
-    
-    # Process each document
-    print("\n3. Processing documents...")
-    total_chunks = 0
-    for doc in documents:
-        chunks_created = process_document(doc, embedding_service, lancedb_client, conn)
-        total_chunks += chunks_created
-    
-    conn.close()
-    
-    # Summary
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    print(f"Documents processed: {len(documents)}")
-    print(f"Total chunks created: {total_chunks}")
-    print(f"Total chunks in LanceDB: {lancedb_client.count()}")
-    print("\n✓ Indexing complete!")
+
+    print(f"Found {len(docs)} document(s) to index.")
+    print("Loading BGE-M3 embedding model (may download ~2GB on first run)...")
+    embedder = EmbeddingService()
+    print(f"  Model loaded. Vector dimension: {embedder.dimension}")
+
+    lancedb = LanceDBClient(path=LANCEDB_PATH)
+    print(f"  LanceDB connected at {LANCEDB_PATH}")
+
+    for doc_id, file_name, ocr_text_path, level, topic in docs:
+        print(f"\nProcessing '{file_name}' (doc_id={doc_id})...")
+
+        # Read OCR JSON
+        ocr_path = Path(ocr_text_path)
+        if not ocr_path.exists():
+            print(f"  ERROR: OCR file not found: {ocr_path}")
+            update_document_status(doc_id, "failed")
+            continue
+
+        with open(ocr_path, "r", encoding="utf-8") as f:
+            ocr_data = json.load(f)
+
+        # Combine text from all pages
+        full_text = "\n\n".join(page["text"] for page in ocr_data.get("pages", []))
+
+        if not full_text.strip():
+            print("  WARNING: No text extracted. Skipping.")
+            update_document_status(doc_id, "failed")
+            continue
+
+        # Chunk
+        text_chunks = chunk_text(full_text)
+        print(f"  Created {len(text_chunks)} chunks")
+
+        # Embed
+        print("  Embedding chunks...")
+        vectors = embedder.embed_batch(text_chunks)
+        print(f"  Embedded {len(vectors)} chunks")
+
+        # Build records for LanceDB
+        lance_records = []
+        page_nums = {p["page_num"] for p in ocr_data.get("pages", [])}
+        for chunk_text_val, vector in zip(text_chunks, vectors):
+            lance_records.append({
+                "id": str(uuid.uuid4()),
+                "doc_id": doc_id,
+                "page_num": min(page_nums) if page_nums else 1,
+                "text": chunk_text_val,
+                "vector": vector,
+                "level": level or "",
+                "topic": topic or "",
+            })
+
+        # Write to LanceDB
+        lancedb.upsert_chunks(lance_records)
+        print(f"  Inserted {len(lance_records)} chunks into LanceDB")
+
+        # Update status
+        update_document_status(doc_id, "indexed")
+        print(f"  Status updated to 'indexed'")
+
+    total_chunks = lancedb.count()
+    print(f"\nDone! Total chunks in LanceDB: {total_chunks}")
 
 
 if __name__ == "__main__":
