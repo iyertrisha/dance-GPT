@@ -1,4 +1,9 @@
-require("dotenv").config({ path: "../.env" });
+const path = require("path");
+require("dotenv").config({
+  path: path.join(__dirname, "..", ".env"),
+  override: true,
+});
+
 const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
@@ -17,8 +22,12 @@ app.use(cookieParser());
 // Routes
 const authRoutes = require("./routes/auth");
 const chatRoutes = require("./routes/chat");
+const notesRoutes = require("./routes/notes");
+const flashcardsRoutes = require("./routes/flashcards");
 app.use("/auth", authRoutes);
 app.use("/chat", chatRoutes);
+app.use("/notes", notesRoutes);
+app.use("/flashcards", flashcardsRoutes);
 
 app.get("/health", async (req, res) => {
   try {
@@ -29,6 +38,9 @@ app.get("/health", async (req, res) => {
   }
 });
 
+const { getAiBaseUrl } = require("./lib/aiServiceUrl");
+
 app.listen(PORT, () => {
   console.log(`DanceGPT API listening on http://localhost:${PORT}`);
+  console.log(`AI service proxy target: ${getAiBaseUrl()} (use 127.0.0.1, not localhost, if port 8000 is shared with Docker)`);
 });

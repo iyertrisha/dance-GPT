@@ -1,0 +1,21 @@
+erDiagram
+    DOCUMENTS ||--o{ CHUNKS : produces
+    DOCUMENTS {
+        uuid id PK
+        text file_name
+        text file_path
+        text ocr_text_path
+        text level
+        text topic
+        text status
+        timestamptz uploaded_at
+    }
+    CHUNKS {
+        utf8 id PK
+        utf8 doc_id FK
+        int32 page_num
+        utf8 text
+        float32_list vector
+        utf8 level
+        utf8 topic
+    }

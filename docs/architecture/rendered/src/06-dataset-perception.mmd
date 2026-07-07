@@ -1,0 +1,20 @@
+flowchart TB
+    subgraph PERCEPTION["Query-time perception"]
+        Q["Natural-language question"]
+        V["Dense vector 1024-d"]
+        ANN["Nearest neighbors in LanceDB"]
+        META["Metadata level topic page_num"]
+        UNIT["~500-char text windows"]
+        Q --> V --> ANN
+        ANN --> UNIT
+        ANN --> META
+    end
+    subgraph GATING["Level-aware gating"]
+        STRICT["Strict SQL filter<br/>user level or General"]
+        SOFT["Soft rescoring<br/>d times 1 + 0.15 times level_distance"]
+        STRICT --> SOFT
+    end
+    ANN --> GATING
+    GATING --> POOL["Candidate pool up to 24"]
+    POOL --> LEX["BM25 lexical view same pool"]
+    POOL --> CE["Cross-encoder query x chunk"]

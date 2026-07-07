@@ -2,10 +2,9 @@ const express = require("express");
 const { v4: uuidv4 } = require("uuid");
 const pool = require("../db/client");
 const requireAuth = require("../middleware/session");
+const { getAiBaseUrl, aiServiceUrl } = require("../lib/aiServiceUrl");
 
 const router = express.Router();
-
-const AI_SERVICE_URL = process.env.AI_SERVICE_URL || "http://localhost:8000";
 
 // GET /chat/sessions - List user's chat sessions
 router.get("/sessions", requireAuth, async (req, res) => {
@@ -119,21 +118,47 @@ router.post("/message", requireAuth, async (req, res) => {
     const history = historyResult.rows.reverse();
 
     // Call Python AI service
-    const aiResponse = await fetch(`${AI_SERVICE_URL}/ai/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        question: content,
-        level: req.user.level,
-        history: history,
-      }),
-    });
-
-    if (!aiResponse.ok) {
-      throw new Error(`AI service error: ${aiResponse.statusText}`);
+    let aiResponse;
+    try {
+      const aiChatEndpoint = aiServiceUrl("/ai/chat");
+      aiResponse = await fetch(aiChatEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question: content,
+          level: req.user.level,
+          history: history,
+        }),
+      });
+    } catch (fetchErr) {
+      console.error("AI service fetch failed:", fetchErr);
+      return res.status(503).json({
+        error: `Cannot reach the AI service at ${getAiBaseUrl()}. Expected POST ${aiChatEndpoint}. Start: cd ai && python -m uvicorn main:app --host 127.0.0.1 --port 8000`,
+      });
     }
 
-    const aiData = await aiResponse.json();
+    if (!aiResponse.ok) {
+      const detail = await aiResponse.text();
+      console.error("AI service HTTP error:", aiResponse.status, detail);
+      const hint404 =
+        aiResponse.status === 404
+          ? ` Another app (often Docker on port 8000) may be answering localhost instead of DanceGPT. Use AI_SERVICE_URL=http://127.0.0.1:8000 and stop conflicting containers. Attempted POST ${aiChatEndpoint}. `
+          : " ";
+      return res.status(502).json({
+        error: `AI service error (${aiResponse.status}).${hint404}Confirm FastAPI is running (${getAiBaseUrl()}, route /ai/chat). Check Groq key and LanceDB if the error persists.`,
+      });
+    }
+
+    let aiData;
+    try {
+      aiData = await aiResponse.json();
+    } catch (parseErr) {
+      return res.status(502).json({ error: "AI service returned invalid JSON." });
+    }
+
+    if (aiData == null || typeof aiData.answer !== "string") {
+      return res.status(502).json({ error: "AI service response missing answer." });
+    }
 
     // Save assistant message
     const assistantMessageId = uuidv4();

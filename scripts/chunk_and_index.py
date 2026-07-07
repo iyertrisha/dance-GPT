@@ -21,6 +21,7 @@ load_dotenv()
 # Allow imports from ai/ package
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ai"))
 
+from contextual import enrich_chunks_for_indexing
 from embeddings import EmbeddingService
 from lancedb_client import LanceDBClient
 
@@ -109,8 +110,9 @@ def main():
             update_document_status(doc_id, "failed")
             continue
 
-        # Chunk
+        # Chunk (optional CONTEXTUAL_CHUNKING=1 prepends doc summary via Groq — see ai/contextual.py)
         text_chunks = chunk_text(full_text)
+        text_chunks = enrich_chunks_for_indexing(full_text, text_chunks)
         print(f"  Created {len(text_chunks)} chunks")
 
         # Embed

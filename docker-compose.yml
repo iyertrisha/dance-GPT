@@ -9,8 +9,9 @@ services:
       POSTGRES_DB: dancegpt
       POSTGRES_USER: dancegpt
       POSTGRES_PASSWORD: dancegpt
+    # Host 5433 avoids clashing with a local Postgres on 5432 (brew / Postgres.app).
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:

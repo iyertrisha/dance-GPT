@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "seed:template-decks": "cd .. && python3 scripts/generate_syllabus_decks.py"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

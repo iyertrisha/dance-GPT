@@ -2,6 +2,8 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import List, Optional
 
+from rag import query_rag
+
 router = APIRouter(prefix="/ai", tags=["chat"])
 
 
@@ -23,9 +25,16 @@ class ChatResponse(BaseModel):
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """
-    Stub chat endpoint that echoes back the question.
-    Real RAG implementation will come in Phase 2.
+    RAG chat: hybrid retrieval, cross-encoder rerank, optional MQE/HyDE/CRAG, Groq generation.
     """
-    return ChatResponse(
-        answer=f"RAG not yet implemented. You asked: {request.question}"
+    history = (
+        [{"role": m.role, "content": m.content} for m in request.history]
+        if request.history
+        else None
     )
+    answer = query_rag(
+        question=request.question,
+        level=request.level,
+        history=history,
+    )
+    return ChatResponse(answer=answer)

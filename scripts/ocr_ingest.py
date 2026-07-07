@@ -25,13 +25,39 @@ from pypdf import PdfReader
 load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# If GOOGLE_APPLICATION_CREDENTIALS points to a missing file, unset it so
+# Google auth falls back to Application Default Credentials (gcloud ADC).
+_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+if _creds and not Path(_creds).expanduser().resolve().exists():
+    del os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
 UPLOADS_DIR = PROJECT_ROOT / "data" / "uploads"
 OCR_DIR = PROJECT_ROOT / "data" / "ocr"
 OCR_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def pdf_pages_to_images(pdf_path: Path) -> list[bytes]:
-    """Convert each PDF page to a PNG image in memory."""
+def pdf_pages_to_images_raster(pdf_path: Path, zoom: float = 2.0) -> list[bytes]:
+    """
+    Rasterize each PDF page to PNG bytes (Vision-compatible).
+    Works for scanned PDFs, vector PDFs, and PDFs without embedded images.
+    """
+    import fitz  # PyMuPDF
+
+    doc = fitz.open(str(pdf_path))
+    mat = fitz.Matrix(zoom, zoom)
+    images: list[bytes] = []
+    try:
+        for i in range(len(doc)):
+            page = doc.load_page(i)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            images.append(pix.tobytes("png"))
+    finally:
+        doc.close()
+    return images
+
+
+def pdf_pages_to_images_embedded(pdf_path: Path) -> list[bytes]:
+    """Extract embedded bitmaps per page via pypdf (fallback only)."""
     reader = PdfReader(str(pdf_path))
     images: list[bytes] = []
 
@@ -39,14 +65,39 @@ def pdf_pages_to_images(pdf_path: Path) -> list[bytes]:
         for image_obj in page.images:
             buf = io.BytesIO()
             img = Image.open(io.BytesIO(image_obj.data))
+            if img.mode not in ("RGB", "L", "RGBA"):
+                img = img.convert("RGB")
+            elif img.mode == "RGBA":
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[3])
+                img = bg
             img.save(buf, format="PNG")
             images.append(buf.getvalue())
 
-    # If pypdf couldn't extract embedded images (common for scanned PDFs),
-    # fall back to sending the raw PDF bytes as a single unit.
-    if not images:
-        images.append(pdf_path.read_bytes())
+    return images
 
+
+def pdf_pages_to_images(pdf_path: Path) -> list[bytes]:
+    """Produce PNG bytes per page for Cloud Vision (never send raw PDF)."""
+    try:
+        images = pdf_pages_to_images_raster(pdf_path)
+        if images:
+            return images
+    except ImportError:
+        print(
+            "  Warning: pymupdf not installed; pip install pymupdf "
+            "(see ai/requirements.txt). Falling back to embedded images only.",
+            file=sys.stderr,
+        )
+    except Exception as e:
+        print(f"  Rasterize failed ({e}); trying embedded images...", file=sys.stderr)
+
+    images = pdf_pages_to_images_embedded(pdf_path)
+    if not images:
+        raise RuntimeError(
+            "Could not produce images from PDF. Install pymupdf (`pip install pymupdf`) "
+            "to rasterize pages, or ensure the PDF contains extractable embedded images."
+        )
     return images
 
 

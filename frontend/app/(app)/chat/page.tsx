@@ -3,6 +3,11 @@
 import { useState, useEffect, useRef, FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { authApi, chatApi } from "@/lib/api";
+import { cn } from "@/lib/cn";
+import { Alert } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Spinner } from "@/components/ui/spinner";
 
 interface Message {
   id: string;
@@ -11,36 +16,84 @@ interface Message {
   created_at: string;
 }
 
+interface SessionRow {
+  id: string;
+  title: string;
+  created_at: string;
+}
+
+function LoadingBubble() {
+  return (
+    <div
+      className="flex min-h-[3rem] max-w-2xl items-center gap-1.5 rounded-xl border border-border bg-card px-4 py-3"
+      aria-busy="true"
+      aria-label="Assistant is composing a reply"
+    >
+      <span className="sr-only">Preparing answer…</span>
+      <span
+        className="size-2 animate-bounce rounded-full bg-accent/80"
+        style={{ animationDelay: "0ms" }}
+      />
+      <span
+        className="size-2 animate-bounce rounded-full bg-accent/80"
+        style={{ animationDelay: "150ms" }}
+      />
+      <span
+        className="size-2 animate-bounce rounded-full bg-accent/80"
+        style={{ animationDelay: "300ms" }}
+      />
+    </div>
+  );
+}
+
 export default function ChatPage() {
   const router = useRouter();
   const [user, setUser] = useState<{ email: string; level: string } | null>(null);
+  const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [sessionsLoading, setSessionsLoading] = useState(true);
+  const [sendError, setSendError] = useState<string | null>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const scrollMessagesToBottom = (behavior: ScrollBehavior = "auto") => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior });
+  };
+
+  const updateStickToBottom = () => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distanceFromBottom < 96;
+  };
 
   useEffect(() => {
-    // Fetch user info and create/get session
     const init = async () => {
       try {
         const userData = await authApi.me();
-        setUser(userData);
+        setUser({ email: userData.email, level: userData.level });
 
-        // Get or create a chat session
-        const sessionsData = await chatApi.getSessions();
-        if (sessionsData.sessions.length > 0) {
-          const latestSession = sessionsData.sessions[0];
-          setSessionId(latestSession.id);
-          const messagesData = await chatApi.getMessages(latestSession.id);
-          setMessages(messagesData.messages);
-        } else {
-          const newSession = await chatApi.createSession("New Chat");
-          setSessionId(newSession.id);
+        let list = (await chatApi.getSessions()).sessions;
+        if (list.length === 0) {
+          const created = await chatApi.createSession("New Chat");
+          list = [created];
         }
+        setSessions(list);
+        const active = list[0];
+        setSessionId(active.id);
+        const messagesData = await chatApi.getMessages(active.id);
+        setMessages(messagesData.messages);
       } catch (err) {
         console.error("Failed to initialize:", err);
         router.push("/login");
+      } finally {
+        setSessionsLoading(false);
       }
     };
 
@@ -48,8 +101,44 @@ export default function ChatPage() {
   }, [router]);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    el.addEventListener("scroll", updateStickToBottom, { passive: true });
+    return () => el.removeEventListener("scroll", updateStickToBottom);
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!stickToBottomRef.current) return;
+    scrollMessagesToBottom(loading ? "auto" : "smooth");
+  }, [messages, loading]);
+
+  const selectSession = async (id: string) => {
+    if (!id || id === sessionId) return;
+    setSendError(null);
+    stickToBottomRef.current = true;
+    setSessionId(id);
+    try {
+      const messagesData = await chatApi.getMessages(id);
+      setMessages(messagesData.messages);
+    } catch (err) {
+      console.error(err);
+      setSendError(err instanceof Error ? err.message : "Could not load messages.");
+    }
+    requestAnimationFrame(() => inputRef.current?.focus());
+  };
+
+  const handleNewChat = async () => {
+    setSendError(null);
+    try {
+      const s = await chatApi.createSession("New Chat");
+      setSessions((prev) => [s, ...prev]);
+      setSessionId(s.id);
+      setMessages([]);
+    } catch (err) {
+      setSendError(err instanceof Error ? err.message : "Could not start a new chat.");
+    }
+    requestAnimationFrame(() => inputRef.current?.focus());
+  };
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -57,9 +146,10 @@ export default function ChatPage() {
 
     const userMessage = input.trim();
     setInput("");
+    setSendError(null);
     setLoading(true);
+    stickToBottomRef.current = true;
 
-    // Optimistically add user message
     const tempUserMessage: Message = {
       id: `temp-${Date.now()}`,
       role: "user",
@@ -67,11 +157,11 @@ export default function ChatPage() {
       created_at: new Date().toISOString(),
     };
     setMessages((prev) => [...prev, tempUserMessage]);
+    requestAnimationFrame(() => scrollMessagesToBottom("auto"));
 
     try {
       const response = await chatApi.sendMessage(userMessage, sessionId);
 
-      // Add assistant message
       const assistantMessage: Message = {
         id: `temp-assistant-${Date.now()}`,
         role: "assistant",
@@ -81,113 +171,180 @@ export default function ChatPage() {
       setMessages((prev) => [...prev, assistantMessage]);
     } catch (err) {
       console.error("Failed to send message:", err);
-      // Remove optimistic message on error
+      const msg =
+        err instanceof Error
+          ? err.message
+          : "Could not reach the server. Check your connection and try again.";
+      setSendError(msg);
       setMessages((prev) => prev.filter((m) => m.id !== tempUserMessage.id));
+      setInput(userMessage);
     } finally {
       setLoading(false);
+      requestAnimationFrame(() => inputRef.current?.focus());
     }
   };
 
-  const handleLogout = async () => {
-    try {
-      await authApi.logout();
-      router.push("/login");
-    } catch (err) {
-      console.error("Logout failed:", err);
-    }
-  };
-
-  if (!user || !sessionId) {
+  if (!user || sessionsLoading || !sessionId) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-slate-900 via-purple-950 to-slate-900 text-white">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-purple-500 mx-auto mb-4"></div>
-          <p className="text-slate-400">Loading...</p>
-        </div>
+      <div
+        className="flex flex-1 flex-col items-center justify-center gap-3 text-foreground"
+        role="status"
+        aria-live="polite"
+      >
+        <Spinner label="Loading chat" />
+        <p className="text-muted-foreground">Loading your session…</p>
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col h-screen bg-gradient-to-br from-slate-900 via-purple-950 to-slate-900 text-white">
-      {/* Header */}
-      <header className="flex items-center justify-between px-6 py-4 border-b border-slate-700/50 bg-slate-900/50 backdrop-blur">
-        <div>
-          <h1 className="text-xl font-bold">
-            Dance<span className="text-purple-400">GPT</span>
-          </h1>
-          <p className="text-sm text-slate-400">
-            {user.email} • {user.level}
-          </p>
-        </div>
-        <button
-          onClick={handleLogout}
-          className="px-4 py-2 text-sm bg-slate-800 hover:bg-slate-700 rounded-md border border-slate-700"
-        >
-          Logout
-        </button>
-      </header>
-
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
-        {messages.length === 0 ? (
-          <div className="text-center text-slate-400 mt-12">
-            <p className="text-lg">Start a conversation about Bharatanatyam!</p>
-            <p className="text-sm mt-2">Ask me anything about your study materials.</p>
-          </div>
-        ) : (
-          messages.map((msg) => (
-            <div
-              key={msg.id}
-              className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
-            >
-              <div
-                className={`max-w-2xl px-4 py-3 rounded-lg ${
-                  msg.role === "user"
-                    ? "bg-purple-600 text-white"
-                    : "bg-slate-800 text-slate-100"
-                }`}
-              >
-                <p className="whitespace-pre-wrap">{msg.content}</p>
-              </div>
-            </div>
-          ))
-        )}
-        {loading && (
-          <div className="flex justify-start">
-            <div className="max-w-2xl px-4 py-3 rounded-lg bg-slate-800 text-slate-100">
-              <div className="flex items-center space-x-2">
-                <div className="animate-pulse">Thinking...</div>
-              </div>
-            </div>
-          </div>
-        )}
-        <div ref={messagesEndRef} />
-      </div>
-
-      {/* Input */}
-      <form
-        onSubmit={handleSubmit}
-        className="px-6 py-4 border-t border-slate-700/50 bg-slate-900/50 backdrop-blur"
+    <div className="flex min-h-0 flex-1 overflow-hidden">
+      <aside
+        className="hidden w-64 shrink-0 flex-col border-r border-border bg-muted/25 md:flex"
+        aria-label="Conversations"
       >
-        <div className="flex gap-2">
-          <input
-            type="text"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Ask a question..."
-            disabled={loading}
-            className="flex-1 px-4 py-3 bg-slate-800 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:opacity-50"
-          />
-          <button
-            type="submit"
-            disabled={loading || !input.trim()}
-            className="px-6 py-3 bg-purple-600 hover:bg-purple-700 rounded-lg font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            Send
-          </button>
+        <div className="border-b border-border p-3">
+          <Button type="button" variant="primary" size="sm" className="w-full" onClick={handleNewChat}>
+            New chat
+          </Button>
         </div>
-      </form>
+        <nav className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto p-2">
+          {sessions.map((s) => {
+            const active = s.id === sessionId;
+            return (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => void selectSession(s.id)}
+                className={cn(
+                  "w-full rounded-lg px-3 py-2.5 text-left text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-muted",
+                  active
+                    ? "bg-accent-muted text-white ring-1 ring-accent/35"
+                    : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                )}
+              >
+                <span className="block truncate font-medium">{s.title}</span>
+                <span className="mt-0.5 block text-[10px] uppercase tracking-wide text-muted-foreground">
+                  {new Date(s.created_at).toLocaleDateString(undefined, {
+                    month: "short",
+                    day: "numeric",
+                  })}
+                </span>
+              </button>
+            );
+          })}
+        </nav>
+      </aside>
+
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        <div className="flex shrink-0 items-center gap-2 border-b border-border bg-muted/20 px-3 py-2 md:hidden">
+          <label htmlFor="session-picker" className="sr-only">
+            Active conversation
+          </label>
+          <select
+            id="session-picker"
+            value={sessionId}
+            onChange={(e) => void selectSession(e.target.value)}
+            className="min-w-0 flex-1 rounded-lg border border-border bg-muted px-3 py-2 text-sm text-foreground focus:border-accent focus:outline-none focus:ring-2 focus:ring-ring/40"
+          >
+            {sessions.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.title}
+              </option>
+            ))}
+          </select>
+          <Button type="button" variant="secondary" size="sm" onClick={handleNewChat}>
+            New
+          </Button>
+        </div>
+
+        <div
+          ref={scrollContainerRef}
+          className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain px-4 py-4 sm:px-6"
+        >
+          <div className="mx-auto max-w-3xl space-y-4">
+            {messages.length === 0 ? (
+              <div className="mt-10 text-center text-muted-foreground sm:mt-16">
+                <p className="text-lg font-medium text-foreground">
+                  Ask about Bharatanatyam Gandharva exams
+                </p>
+                <p className="mx-auto mt-3 max-w-md text-sm leading-relaxed">
+                  Answers use your indexed study materials (syllabus, theory, and related text). Your
+                  exam level filters what the tutor retrieves.
+                </p>
+              </div>
+            ) : (
+              messages.map((msg) => (
+                <div
+                  key={msg.id}
+                  className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+                >
+                  <div
+                    className={`flex max-w-[min(100%,42rem)] flex-col gap-1 ${
+                      msg.role === "user" ? "items-end" : "items-start"
+                    }`}
+                  >
+                    <span className="px-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      {msg.role === "user" ? "You" : "Tutor"}
+                    </span>
+                    <div
+                      className={`rounded-2xl px-4 py-3 shadow-lg ${
+                        msg.role === "user"
+                          ? "rounded-br-md bg-accent text-accent-foreground"
+                          : "rounded-bl-md border border-border bg-card text-foreground"
+                      }`}
+                    >
+                      <p
+                        className={cn(
+                          "whitespace-pre-wrap text-[15px] leading-relaxed",
+                          msg.role === "assistant" && "text-slate-200"
+                        )}
+                      >
+                        {msg.content}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              ))
+            )}
+            {loading ? (
+              <div className="flex justify-start">
+                <div className="flex max-w-[min(100%,42rem)] flex-col items-start gap-1">
+                  <span className="px-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    Tutor
+                  </span>
+                  <LoadingBubble />
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="shrink-0 border-t border-border bg-muted/30 px-4 py-3 backdrop-blur sm:px-6 sm:py-4">
+          <form className="mx-auto max-w-3xl" onSubmit={handleSubmit}>
+            {sendError ? <Alert className="mb-3">{sendError}</Alert> : null}
+            <div className="flex gap-2">
+              <Input
+                ref={inputRef}
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder="Ask a question from your materials…"
+                disabled={loading}
+                autoComplete="off"
+                className="mt-0 flex-1 rounded-xl py-3"
+              />
+              <Button
+                type="submit"
+                disabled={loading || !input.trim()}
+                className="shrink-0 rounded-xl px-5"
+              >
+                Send
+              </Button>
+            </div>
+          </form>
+        </div>
+      </div>
     </div>
   );
 }

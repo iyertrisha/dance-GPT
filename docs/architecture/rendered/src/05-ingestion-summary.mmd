@@ -1,0 +1,12 @@
+flowchart LR
+    A["PDF syllabus uploads"] --> B["PyMuPDF Pillow rasterize"]
+    B --> C["Google Cloud Vision OCR"]
+    C --> D["OCR JSON Postgres<br/>status ocr_done"]
+    D --> E["Character chunks 500/50"]
+    E --> F{"CONTEXTUAL_CHUNKING?"}
+    F -->|yes| G["Groq doc header per PDF"]
+    F -->|no| H["Raw chunk text"]
+    G --> I["BGE-M3 embed_batch"]
+    H --> I
+    I --> J["LanceDB upsert"]
+    J --> K["Postgres status indexed"]

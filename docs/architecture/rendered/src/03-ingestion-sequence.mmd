@@ -1,0 +1,26 @@
+sequenceDiagram
+    participant PDF as Syllabus PDFs
+    participant OCR as ocr_ingest.py
+    participant GCV as Google Cloud Vision
+    participant PG as PostgreSQL documents
+    participant IDX as chunk_and_index.py
+    participant CTX as contextual.py optional
+    participant GQ as Groq Llama 3.3 optional
+    participant E as BAAI bge-m3
+    participant L as LanceDB chunks
+    PDF->>OCR: Rasterize pages to PNG
+    OCR->>GCV: document_text_detection
+    GCV-->>OCR: full_text_annotation per page
+    OCR->>PG: INSERT documents status ocr_done
+    IDX->>PG: SELECT status ocr_done
+    IDX->>IDX: chunk_text 500 chars overlap 50
+    alt CONTEXTUAL_CHUNKING=1
+        IDX->>CTX: Document excerpt
+        CTX->>GQ: 1-2 sentence syllabus header
+        GQ-->>CTX: Header text
+        CTX-->>IDX: Prepend header to each chunk
+    end
+    IDX->>E: embed_batch chunks
+    E-->>IDX: 1024-d L2-normalized vectors
+    IDX->>L: upsert_chunks
+    IDX->>PG: UPDATE status indexed

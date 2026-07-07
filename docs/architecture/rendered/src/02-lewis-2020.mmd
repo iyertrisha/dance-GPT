@@ -1,0 +1,18 @@
+flowchart TB
+    subgraph OFFLINE["Offline corpus indexing lane"]
+        W["Wikipedia passages<br/>~100-word splits"]
+        DPRd["DPR document encoder<br/>BERT bi-encoder"]
+        FAISS["FAISS MIPS index<br/>~21M passages"]
+        W --> DPRd --> FAISS
+    end
+    subgraph ONLINE["Query-time inference"]
+        Q["User query"]
+        DPRq["DPR query encoder"]
+        MIPS["FAISS MIPS top-k"]
+        CTX["Concatenate retrieved passages"]
+        BART["BART generator<br/>jointly trained with retriever"]
+        OUT["Generated answer"]
+        Q --> DPRq --> MIPS
+        FAISS -.->|ANN lookup| MIPS
+        MIPS --> CTX --> BART --> OUT
+    end

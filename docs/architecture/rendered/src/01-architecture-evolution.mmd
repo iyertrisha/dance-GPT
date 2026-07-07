@@ -1,0 +1,7 @@
+flowchart LR
+    L["Lewis 2020<br/>DPR + FAISS + BART<br/>Open Wikipedia"]
+    C["CRAG 2024<br/>DPR + T5 evaluator<br/>Web fallback branches"]
+    B["BGE-M3 2024<br/>Dense + sparse + multi-vec<br/>Hybrid embedding fusion"]
+    D["DanceGPT<br/>BGE-M3 dense + LanceDB<br/>BM25+RRF + reranker<br/>Llama judge + closed syllabus"]
+    L --> C --> B --> D
+    style D fill:#2d5016,color:#fff
